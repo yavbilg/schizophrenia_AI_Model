@@ -1,0 +1,391 @@
+import numpy as np
+import pandas as pd
+from sklearn.model_selection import train_test_split
+from sklearn.impute import SimpleImputer
+from sklearn.preprocessing import LabelEncoder
+from sklearn.metrics import accuracy_score, recall_score, f1_score, confusion_matrix
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.linear_model import LogisticRegression
+from sklearn.svm import SVC
+from sklearn.neighbors import KNeighborsClassifier
+from xgboost import XGBClassifier
+import matplotlib.pyplot as plt
+from sklearn.model_selection import cross_val_score, StratifiedKFold
+from sklearn.metrics import make_scorer, confusion_matrix
+from sklearn.metrics import roc_curve, roc_auc_score
+from sklearn.model_selection import StratifiedKFold
+
+
+# Random seed
+np.random.seed(42)
+
+#  Data loading and cleaning
+kontrol = pd.read_excel("Kontrol_Verisi.xlsx")
+sizo = pd.read_excel("sizofreni_verisi.xlsx")
+kontrol["Label"] = 0
+sizo["Label"] = 1
+veri = pd.concat([kontrol, sizo], ignore_index=True)
+veri = veri.drop(columns=["Denek Numarası"], errors="ignore")
+
+
+# Custom specificity scorer
+def specificity_scorer(y_true, y_pred):
+    tn, fp, fn, tp = confusion_matrix(y_true, y_pred).ravel()
+    return tn / (tn + fp)
+
+specificity = make_scorer(specificity_scorer)
+# Missing values
+missing_rate = veri.isnull().sum() / len(veri) * 100
+veri = veri.drop(columns=missing_rate[missing_rate > 85].index)
+
+for col in veri.select_dtypes(include='number').columns:
+    veri[col] = veri[col].fillna(veri[col].median())
+for col in veri.select_dtypes(include='object').columns:
+    veri[col] = veri[col].fillna(veri[col].mode()[0])
+
+if "Cinsiyet" in veri.columns:
+    le = LabelEncoder()
+    veri["Cinsiyet"] = le.fit_transform(veri["Cinsiyet"])
+
+X = veri.drop(columns=["Label"]).apply(pd.to_numeric, errors='coerce')
+y = veri["Label"]
+
+# Train/test split and imputation
+X_train, X_test, y_train, y_test = train_test_split(X, y, stratify=y, test_size=0.2, random_state=42)
+
+# Drop columns with all NaN values before imputation
+X_train = X_train.dropna(axis=1, how='all')
+X_test = X_test.dropna(axis=1, how='all')
+
+
+imputer = SimpleImputer(strategy="median")
+X_train = pd.DataFrame(imputer.fit_transform(X_train), columns=X_train.columns)
+X_test = pd.DataFrame(imputer.transform(X_test), columns=X_test.columns)
+
+
+# Models
+models = {
+    "Random Forest": RandomForestClassifier(random_state=42),
+    "Logistic Regression": LogisticRegression(max_iter=1000, random_state=42),
+    "SVM": SVC(probability=True, random_state=42),
+    "KNN": KNeighborsClassifier(),
+    "XGBoost": XGBClassifier(use_label_encoder=False, eval_metric='logloss', random_state=42)
+}
+
+results_before_cv = []
+
+cv = StratifiedKFold(n_splits=10, shuffle=True, random_state=42)
+
+for name, model in models.items():
+    acc_cv = cross_val_score(model, X_train, y_train, cv=cv, scoring='accuracy').mean()
+    recall_cv = cross_val_score(model, X_train, y_train, cv=cv, scoring='recall').mean()
+    specificity_cv = cross_val_score(model, X_train, y_train, cv=cv, scoring=specificity).mean()
+    f1_cv = cross_val_score(model, X_train, y_train, cv=cv, scoring='f1').mean()
+
+    #  AUC calculation (10-fold)
+    aucs = []
+    for train_idx, test_idx in cv.split(X_train, y_train):
+        model.fit(X_train.iloc[train_idx], y_train.iloc[train_idx])
+        if hasattr(model, "predict_proba"):
+            y_scores = model.predict_proba(X_train.iloc[test_idx])[:, 1]
+        else:
+            y_scores = model.decision_function(X_train.iloc[test_idx])
+        auc = roc_auc_score(y_train.iloc[test_idx], y_scores)
+        aucs.append(auc)
+    auc_cv = np.mean(aucs)
+
+    results_before_cv.append({
+        "Model": name,
+        "Accuracy (CV)": round(acc_cv, 4),
+        "Recall (CV)": round(recall_cv, 4),
+        "Specificity (CV)": round(specificity_cv, 4),
+        "F1 Score (CV)": round(f1_cv, 4),
+        "AUC (CV)": round(auc_cv, 4)
+    })
+
+before_cv_df = pd.DataFrame(results_before_cv).set_index("Model")
+
+print("\n Model Performance BEFORE GWO (5-Fold CV):")
+print(before_cv_df)
+
+#  GWO Algorithm
+def fitness_function(solution):
+    selected_indices = [i for i, val in enumerate(solution) if val > 0.5]
+    if len(selected_indices) == 0:
+        return 1
+    X_train_sel = X_train.iloc[:, selected_indices]
+    X_test_sel = X_test.iloc[:, selected_indices]
+    model = RandomForestClassifier(random_state=42)
+    model.fit(X_train_sel, y_train)
+    y_pred = model.predict(X_test_sel)
+    return 1 - accuracy_score(y_test, y_pred)
+
+def gwo_optimize(dim, fitness_func, lb, ub, pop_size=10, max_iter=20):
+    alpha_pos = np.zeros(dim)
+    beta_pos = np.zeros(dim)
+    delta_pos = np.zeros(dim)
+    alpha_score = beta_score = delta_score = float("inf")
+    wolves = np.random.uniform(lb, ub, (pop_size, dim))
+
+    best_scores = []  # List to hold the best fitness values
+
+    for t in range(max_iter):
+        for i in range(pop_size):
+            fitness = fitness_func(wolves[i])
+            if fitness < alpha_score:
+                alpha_score, alpha_pos = fitness, wolves[i].copy()
+            elif fitness < beta_score:
+                beta_score, beta_pos = fitness, wolves[i].copy()
+            elif fitness < delta_score:
+                delta_score, delta_pos = fitness, wolves[i].copy()
+
+        best_scores.append(alpha_score)  # Add the best fitness in each iteration
+
+        a = 2 - t * (2 / max_iter)
+        for i in range(pop_size):
+            for j in range(dim):
+                r = np.random.rand
+                A1, C1 = 2*a*r()-a, 2*r()
+                A2, C2 = 2*a*r()-a, 2*r()
+                A3, C3 = 2*a*r()-a, 2*r()
+                X1 = alpha_pos[j] - A1 * abs(C1 * alpha_pos[j] - wolves[i][j])
+                X2 = beta_pos[j] - A2 * abs(C2 * beta_pos[j] - wolves[i][j])
+                X3 = delta_pos[j] - A3 * abs(C3 * delta_pos[j] - wolves[i][j])
+                wolves[i][j] = (X1 + X2 + X3) / 3
+            wolves[i] = np.clip(wolves[i], lb, ub)
+
+    # Plot the convergence curve
+    plt.figure(figsize=(10, 6))
+    plt.plot(range(1, max_iter+1), best_scores, marker="o", linestyle="-", color="b")
+    plt.title("Convergence Curve of the GWO Algorithm")
+    plt.xlabel("Number of Iterations")
+    plt.ylabel("Best Fitness Value (1 - Accuracy)")
+    plt.grid(True)
+    plt.tight_layout()
+    plt.show()
+
+    return alpha_pos, alpha_score
+
+# Select best features with GWO
+best_sol, _ = gwo_optimize(X_train.shape[1], fitness_function, lb=0, ub=1)
+selected_indices = [i for i, val in enumerate(best_sol) if val > 0.5]
+selected_features = X_train.columns[selected_indices]
+
+X_train_sel = X_train[selected_features]
+X_test_sel = X_test[selected_features]
+
+
+#  ALL METRICS AFTER GWO
+results_after_cv = []
+
+for name, model in models.items():
+    acc_cv = cross_val_score(model, X_train_sel, y_train, cv=cv, scoring='accuracy').mean()
+    recall_cv = cross_val_score(model, X_train_sel, y_train, cv=cv, scoring='recall').mean()
+    specificity_cv = cross_val_score(model, X_train_sel, y_train, cv=cv, scoring=specificity).mean()
+    f1_cv = cross_val_score(model, X_train_sel, y_train, cv=cv, scoring='f1').mean()
+
+    results_after_cv.append({
+        "Model": name,
+        "Accuracy (CV)": round(acc_cv, 4),
+        "Recall (CV)": round(recall_cv, 4),
+        "Specificity (CV)": round(specificity_cv, 4),
+        "F1 Score (CV)": round(f1_cv, 4)
+    })
+
+after_cv_df = pd.DataFrame(results_after_cv).set_index("Model")
+
+print("\n Model Performance AFTER GWO (5-Fold CV):")
+print(after_cv_df)
+
+# Comparative Table (Before vs. After GWO)
+compare_cv_df = pd.concat([
+    before_cv_df.add_suffix(" (Before GWO)"),
+    after_cv_df.add_suffix(" (After GWO)")
+], axis=1)
+
+print("\n Comparative Performance Table (Before vs. After GWO):")
+print(compare_cv_df)
+
+# VISUAL COMPARISON BEFORE and AFTER GWO
+metrics = ["Accuracy", "Recall", "Specificity", "F1 Score"]
+fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+axes = axes.flatten()
+
+for i, metric in enumerate(metrics):
+    before = compare_cv_df[f"{metric} (CV) (Before GWO)"]
+    after = compare_cv_df[f"{metric} (CV) (After GWO)"]
+
+    ax = axes[i]
+    width = 0.35
+    indices = np.arange(len(compare_cv_df))
+
+    ax.barh(indices, before, width, label="Before GWO", color="gray")
+    ax.barh(indices + width, after, width, label="After GWO", color="seagreen")
+
+    ax.set_yticks(indices + width / 2)
+    ax.set_yticklabels(compare_cv_df.index)
+    ax.set_title(f"{metric} Comparison")
+    ax.set_xlabel(metric)
+    ax.set_xlim(0, 1)
+    ax.grid(axis="x")
+    ax.legend()
+
+plt.tight_layout()
+plt.show()
+
+from scipy.stats import ttest_ind
+
+# Clean column names
+veri.columns = [col.strip() for col in veri.columns]
+
+# Clean numerical columns
+X_cleaned = veri.drop(columns=["Label"]).apply(pd.to_numeric, errors='coerce')
+numerical_columns = X_cleaned.select_dtypes(include='number').columns
+
+# Separate groups
+kontrol_df = veri[veri["Label"] == 0]
+sizo_df = veri[veri["Label"] == 1]
+
+# Comparative analysis
+analysis_results = []
+
+for col in numerical_columns:
+    try:
+        kontrol_vals = pd.to_numeric(kontrol_df[col], errors="coerce").dropna()
+        sizo_vals = pd.to_numeric(sizo_df[col], errors="coerce").dropna()
+
+        if len(kontrol_vals) > 1 and len(sizo_vals) > 1:
+            kontrol_mean = kontrol_vals.mean()
+            sizo_mean = sizo_vals.mean()
+            kontrol_std = kontrol_vals.std()
+            sizo_std = sizo_vals.std()
+            t_stat, p_val = ttest_ind(kontrol_vals, sizo_vals, equal_var=False)
+
+            analysis_results.append({
+                "Feature": col,
+                "Control Mean": round(kontrol_mean, 3),
+                "Control Std": round(kontrol_std, 3),
+                "Schizophrenia Mean": round(sizo_mean, 3),
+                "Schizophrenia Std": round(sizo_std, 3),
+                "p-value": round(p_val, 4)
+            })
+    except Exception as e:
+        print(f"Error: {col} --> {e}")
+        continue
+
+# Check results
+stats_df = pd.DataFrame(analysis_results).sort_values(by="p-value")
+print(stats_df.to_string(index=False))
+
+
+# Print all results
+print("\n Comparison of All Features for Schizophrenia and Control Groups:\n")
+print(stats_df.to_string(index=False))
+
+
+
+
+cv = StratifiedKFold(n_splits=10, shuffle=True, random_state=42)
+
+plt.figure(figsize=(10, 7))
+
+for name, model in models.items():
+    tprs = []
+    mean_fpr = np.linspace(0, 1, 100)
+    aucs = []
+
+    for train, test in cv.split(X_train_sel, y_train):
+        model.fit(X_train_sel.iloc[train], y_train.iloc[train])
+
+        if hasattr(model, "predict_proba"):
+            y_scores = model.predict_proba(X_train_sel.iloc[test])[:, 1]
+        else:
+            y_scores = model.decision_function(X_train_sel.iloc[test])
+
+        fpr, tpr, _ = roc_curve(y_train.iloc[test], y_scores)
+        auc = roc_auc_score(y_train.iloc[test], y_scores)
+        aucs.append(auc)
+
+        interp_tpr = np.interp(mean_fpr, fpr, tpr)
+        interp_tpr[0] = 0.0
+        tprs.append(interp_tpr)
+
+    mean_tpr = np.mean(tprs, axis=0)
+    mean_tpr[-1] = 1.0
+    mean_auc = np.mean(aucs)
+
+    plt.plot(mean_fpr, mean_tpr, label=f"{name} (Mean AUC = {mean_auc:.2f})")
+
+plt.plot([0, 1], [0, 1], "k--", label="Random (AUC = 0.5)")
+plt.xlabel("False Positive Rate (1 - Specificity)")
+plt.ylabel("True Positive Rate (Sensitivity)")
+plt.title("ROC Curves of Classifiers (10-Fold CV After GWO)")
+plt.legend(loc="lower right")
+plt.grid(True)
+plt.tight_layout()
+plt.show()
+
+for name, model in models.items():
+    if hasattr(model, "feature_importances_"):
+        model.fit(X_train_sel, y_train)
+        importances = model.feature_importances_
+        importance_df = pd.DataFrame({
+            "Feature": X_train_sel.columns,
+            "Importance": importances
+        }).sort_values(by="Importance", ascending=False)
+
+        print(f"\n {name} - Top Important Features:")
+        print(importance_df.head(20).to_string(index=False))  # print top 10
+
+
+
+
+from scipy.stats import ttest_ind
+
+# Relevant features
+features = ["Potasyum", "Demir", "Ferritin"]
+
+# Separate groups
+kontrol_df = veri[veri["Label"] == 0]
+sizo_df = veri[veri["Label"] == 1]
+
+print("\n Potassium, Iron, and Ferritin Difference Analysis:\n")
+for feature in features:
+    if feature in veri.columns:
+        kontrol_vals = pd.to_numeric(kontrol_df[feature], errors="coerce").dropna()
+        sizo_vals = pd.to_numeric(sizo_df[feature], errors="coerce").dropna()
+
+
+        kontrol_mean = kontrol_vals.mean()
+        sizo_mean = sizo_vals.mean()
+        kontrol_std = kontrol_vals.std()
+        sizo_std = sizo_vals.std()
+
+        t_stat, p_val = ttest_ind(kontrol_vals, sizo_vals, equal_var=False)
+
+        print(f" Results for {feature}:")
+        print(f"Control Group Mean ± Std: {float(kontrol_mean):.2f} ± {float(kontrol_std):.2f}")
+
+        print(f"Schizophrenia Group Mean ± Std: {sizo_mean:.2f} ± {sizo_std:.2f}")
+        print(f"p-value: {p_val:.4f} {'Significant' if p_val < 0.05 else ' Not significant'}\n")
+    else:
+        print(f" '{feature}' column not found in the dataset!\n")
+
+
+
+# Feature importance check (Random Forest and XGBoost)
+models_to_check = {
+    "Random Forest": RandomForestClassifier(random_state=42),
+    "XGBoost": XGBClassifier(use_label_encoder=False, eval_metric='logloss', random_state=42)
+}
+
+for name, model in models_to_check.items():
+    model.fit(X_train_sel, y_train)
+    importances = model.feature_importances_
+    importance_df = pd.DataFrame({
+        "Feature": selected_features,
+        "Importance": importances
+    }).sort_values(by="Importance", ascending=False)
+
+    print(f"\n {name} - Top 20 Important Features (After CV & GWO):")
+    print(importance_df.head(20).to_string(index=False))
